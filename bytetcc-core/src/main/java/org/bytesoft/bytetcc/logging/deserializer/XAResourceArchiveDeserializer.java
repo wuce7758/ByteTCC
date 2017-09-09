@@ -17,14 +17,12 @@ package org.bytesoft.bytetcc.logging.deserializer;
 
 import java.nio.ByteBuffer;
 
-import javax.transaction.xa.XAResource;
 import javax.transaction.xa.Xid;
 
 import org.bytesoft.bytejta.supports.resource.CommonResourceDescriptor;
 import org.bytesoft.bytejta.supports.resource.LocalXAResourceDescriptor;
 import org.bytesoft.bytejta.supports.resource.RemoteResourceDescriptor;
 import org.bytesoft.bytejta.supports.resource.UnidentifiedResourceDescriptor;
-import org.bytesoft.bytejta.supports.wire.RemoteCoordinator;
 import org.bytesoft.compensable.CompensableBeanFactory;
 import org.bytesoft.compensable.aware.CompensableBeanFactoryAware;
 import org.bytesoft.transaction.archive.XAResourceArchive;
@@ -97,38 +95,30 @@ public class XAResourceArchiveDeserializer implements ArchiveDeserializer, Compe
 		TransactionXid branchXid = xidFactory.createBranchXid(xid, branchQualifier);
 		archive.setXid(branchXid);
 
-		XAResourceDescriptor descriptor = null;
 		byte resourceType = buffer.get();
 		byte length = buffer.get();
 		byte[] byteArray = new byte[length];
 		buffer.get(byteArray);
 		String identifier = new String(byteArray);
 
+		XAResourceDescriptor descriptor = null;
 		if (resourceType == 0x01) {
 			archive.setIdentified(true);
-			CommonResourceDescriptor resourceDescriptor = new CommonResourceDescriptor();
-			XAResource resource = this.deserializer.deserialize(identifier);
-			resourceDescriptor.setDelegate(resource);
-			resourceDescriptor.setIdentifier(identifier);
-			descriptor = resourceDescriptor;
+			descriptor = deserializer.deserialize(identifier);
 		} else if (resourceType == 0x02) {
 			archive.setIdentified(true);
-			RemoteResourceDescriptor resourceDescriptor = new RemoteResourceDescriptor();
-			XAResource resource = this.deserializer.deserialize(identifier);
-			resourceDescriptor.setDelegate((RemoteCoordinator) resource);
-			resourceDescriptor.setIdentifier(identifier);
-			descriptor = resourceDescriptor;
+			descriptor = deserializer.deserialize(identifier);
 		} else if (resourceType == 0x03) {
 			archive.setIdentified(true);
-			XAResource resource = this.deserializer.deserialize(identifier);
-			LocalXAResourceDescriptor resourceDescriptor = new LocalXAResourceDescriptor();
-			resourceDescriptor.setDelegate(resource);
-			resourceDescriptor.setIdentifier(identifier);
-			descriptor = resourceDescriptor;
+			descriptor = deserializer.deserialize(identifier);
 		} else {
-			UnidentifiedResourceDescriptor resourceDescriptor = new UnidentifiedResourceDescriptor();
-			descriptor = resourceDescriptor;
+			descriptor = new UnidentifiedResourceDescriptor();
 		}
+
+		if (CommonResourceDescriptor.class.isInstance(descriptor)) {
+			((CommonResourceDescriptor) descriptor).setRecoverXid(branchXid);
+		}
+
 		archive.setDescriptor(descriptor);
 
 		int branchVote = buffer.get();

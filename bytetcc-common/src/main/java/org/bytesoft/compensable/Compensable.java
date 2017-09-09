@@ -24,6 +24,8 @@ import java.lang.annotation.Target;
 @Target({ ElementType.TYPE })
 public @interface Compensable {
 
+	public boolean simplified() default false;
+
 	public Class<?> interfaceClass();
 
 	public String confirmableKey() default "";

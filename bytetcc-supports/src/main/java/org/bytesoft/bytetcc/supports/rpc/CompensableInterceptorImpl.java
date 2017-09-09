@@ -16,7 +16,9 @@
 package org.bytesoft.bytetcc.supports.rpc;
 
 import javax.transaction.RollbackException;
+import javax.transaction.Status;
 import javax.transaction.SystemException;
+import javax.transaction.xa.XAException;
 import javax.transaction.xa.XAResource;
 
 import org.bytesoft.bytejta.supports.resource.RemoteResourceDescriptor;
@@ -28,7 +30,6 @@ import org.bytesoft.compensable.CompensableManager;
 import org.bytesoft.compensable.CompensableTransaction;
 import org.bytesoft.compensable.aware.CompensableBeanFactoryAware;
 import org.bytesoft.transaction.TransactionContext;
-import org.bytesoft.transaction.internal.TransactionException;
 import org.bytesoft.transaction.supports.rpc.TransactionInterceptor;
 import org.bytesoft.transaction.supports.rpc.TransactionRequest;
 import org.bytesoft.transaction.supports.rpc.TransactionResponse;
@@ -56,6 +57,11 @@ public class CompensableInterceptorImpl implements TransactionInterceptor, Compe
 		TransactionXid globalXid = xidFactory.createGlobalXid(currentXid.getGlobalTransactionId());
 		transactionContext.setXid(globalXid);
 		request.setTransactionContext(transactionContext);
+
+		if (transaction.getTransactionStatus() == Status.STATUS_MARKED_ROLLBACK) {
+			throw new IllegalStateException(
+					"Transaction has been marked as rollback only, can not propagate its context to remote branch.");
+		} // end-if (transaction.getTransactionStatus() == Status.STATUS_MARKED_ROLLBACK)
 
 		try {
 			RemoteCoordinator resource = request.getTargetTransactionCoordinator();
@@ -89,7 +95,7 @@ public class CompensableInterceptorImpl implements TransactionInterceptor, Compe
 		transactionContext.setPropagatedBy(srcTransactionContext.getPropagatedBy());
 		try {
 			compensableCoordinator.start(transactionContext, XAResource.TMNOFLAGS);
-		} catch (TransactionException ex) {
+		} catch (XAException ex) {
 			logger.error("CompensableInterceptorImpl.afterReceiveRequest({})", request, ex);
 			IllegalStateException exception = new IllegalStateException();
 			exception.initCause(ex);
@@ -113,7 +119,7 @@ public class CompensableInterceptorImpl implements TransactionInterceptor, Compe
 		response.setTransactionContext(transactionContext);
 		try {
 			compensableCoordinator.end(transactionContext, XAResource.TMSUCCESS);
-		} catch (TransactionException ex) {
+		} catch (XAException ex) {
 			logger.error("CompensableInterceptorImpl.beforeSendResponse({})", response, ex);
 			IllegalStateException exception = new IllegalStateException();
 			exception.initCause(ex);

@@ -25,6 +25,8 @@ import org.bytesoft.bytetcc.supports.CompensableSynchronization;
 import org.bytesoft.bytetcc.supports.spring.aware.CompensableBeanNameAware;
 import org.bytesoft.compensable.Compensable;
 import org.bytesoft.compensable.CompensableBeanFactory;
+import org.bytesoft.compensable.CompensableCancel;
+import org.bytesoft.compensable.CompensableConfirm;
 import org.bytesoft.compensable.CompensableInvocation;
 import org.bytesoft.compensable.CompensableInvocationRegistry;
 import org.bytesoft.compensable.CompensableManager;
@@ -63,6 +65,13 @@ public class CompensableMethodInterceptor
 	}
 
 	public Object invoke(MethodInvocation mi) throws Throwable {
+		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+		CompensableTransaction compensable = compensableManager.getCompensableTransactionQuietly();
+		if (compensable != null && compensable.getTransactionContext() != null
+				&& compensable.getTransactionContext().isCompensating()) {
+			return mi.proceed();
+		}
+
 		String identifier = null;
 		Object bean = mi.getThis();
 		if (CompensableBeanNameAware.class.isInstance(bean)) {
@@ -102,11 +111,38 @@ public class CompensableMethodInterceptor
 		try {
 			CompensableInvocationImpl invocation = new CompensableInvocationImpl();
 			Method method = mi.getMethod();
-			invocation.setMethod(annotation.interfaceClass().getMethod(method.getName(), method.getParameterTypes()));
 			invocation.setArgs(mi.getArguments());
-			invocation.setCancellableKey(annotation.cancellableKey());
-			invocation.setConfirmableKey(annotation.confirmableKey());
+
 			invocation.setIdentifier(identifier);
+			invocation.setSimplified(annotation.simplified());
+
+			Class<?> interfaceClass = annotation.interfaceClass();
+			String methodName = method.getName();
+			Class<?>[] parameterTypes = method.getParameterTypes();
+			if (annotation.simplified()) {
+				invocation.setMethod(method); // class-method
+
+				Class<?> currentClazz = mi.getThis().getClass();
+				Method[] methodArray = currentClazz.getDeclaredMethods();
+				boolean confirmFlag = false;
+				boolean cancelFlag = false;
+
+				for (int i = 0; (confirmFlag == false || cancelFlag == false) && i < methodArray.length; i++) {
+					Method element = methodArray[i];
+					if (element.getAnnotation(CompensableConfirm.class) != null) {
+						confirmFlag = true;
+						invocation.setConfirmableKey(identifier);
+					}
+					if (element.getAnnotation(CompensableCancel.class) != null) {
+						cancelFlag = true;
+						invocation.setCancellableKey(identifier);
+					}
+				}
+			} else {
+				invocation.setMethod(interfaceClass.getMethod(methodName, parameterTypes));
+				invocation.setConfirmableKey(annotation.confirmableKey());
+				invocation.setCancellableKey(annotation.cancellableKey());
+			}
 
 			Transaction transaction = transactionManager.getTransactionQuietly();
 			CompensableTransaction compensable = compensableManager.getCompensableTransactionQuietly();
@@ -134,7 +170,7 @@ public class CompensableMethodInterceptor
 			registry.register(invocation);
 			return mi.proceed();
 		} finally {
-			registry.unegister();
+			registry.unRegister();
 
 			if (desociateRequired) {
 				transactionManager.desociateThread();

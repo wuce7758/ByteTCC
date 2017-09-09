@@ -5,13 +5,13 @@
 	<parent>
 		<groupId>org.bytesoft</groupId>
 		<artifactId>bytetcc-parent</artifactId>
-		<version>0.3.0-RC3</version>
+		<version>0.5.0-SNAPSHOT</version>
 	</parent>
 	<artifactId>bytetcc-supports</artifactId>
 	<packaging>jar</packaging>
 
 	<name>bytetcc-supports</name>
-	<description>The bytetcc-supports project the module of ByteTCC for integrating with third-party open source project.</description>
+	<description>The bytetcc-supports project is the module of ByteTCC for integrating with third-party open source project.</description>
 	<url>http://www.bytesoft.org</url>
 
 	<properties>
@@ -22,57 +22,64 @@
 		<dependency>
 			<groupId>org.bytesoft</groupId>
 			<artifactId>bytetcc-core</artifactId>
-			<version>0.3.0-RC3</version>
 		</dependency>
 		<dependency>
 			<groupId>org.bytesoft</groupId>
 			<artifactId>bytejta-supports</artifactId>
-			<version>0.3.0-RC3</version>
+			<exclusions>
+				<exclusion>
+					<groupId>org.springframework</groupId>
+					<artifactId>spring-jdbc</artifactId>
+				</exclusion>
+				<exclusion>
+					<groupId>org.springframework</groupId>
+					<artifactId>spring-tx</artifactId>
+				</exclusion>
+				<exclusion>
+					<groupId>org.springframework</groupId>
+					<artifactId>spring-aop</artifactId>
+				</exclusion>
+				<exclusion>
+					<groupId>org.springframework</groupId>
+					<artifactId>spring-context</artifactId>
+				</exclusion>
+			</exclusions>
 		</dependency>
 		<dependency>
 			<groupId>javax.servlet</groupId>
 			<artifactId>javax.servlet-api</artifactId>
-			<version>3.1.0</version>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework</groupId>
 			<artifactId>spring-context</artifactId>
-			<version>3.2.8.RELEASE</version>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework</groupId>
 			<artifactId>spring-tx</artifactId>
-			<version>3.2.8.RELEASE</version>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework</groupId>
 			<artifactId>spring-jdbc</artifactId>
-			<version>3.2.8.RELEASE</version>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework</groupId>
 			<artifactId>spring-aop</artifactId>
-			<version>3.2.8.RELEASE</version>
 		</dependency>
 		<dependency>
 			<groupId>aopalliance</groupId>
 			<artifactId>aopalliance</artifactId>
-			<version>1.0</version>
 		</dependency>
 		<dependency>
 			<groupId>cglib</groupId>
 			<artifactId>cglib</artifactId>
-			<version>2.2.2</version>
 		</dependency>
 		<dependency>
 			<groupId>org.aspectj</groupId>
 			<artifactId>aspectjweaver</artifactId>
-			<version>1.6.8</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.curator</groupId>
 			<artifactId>curator-recipes</artifactId>
-			<version>2.11.0</version>
 		</dependency>
 	</dependencies>
 </project>

@@ -22,11 +22,13 @@ import java.util.Map;
 import javax.transaction.Status;
 import javax.transaction.SystemException;
 import javax.transaction.xa.XAException;
-import javax.transaction.xa.XAResource;
 import javax.transaction.xa.Xid;
 
 import org.apache.commons.lang3.StringUtils;
 import org.bytesoft.bytejta.supports.jdbc.RecoveredResource;
+import org.bytesoft.bytejta.supports.resource.LocalXAResourceDescriptor;
+import org.bytesoft.bytejta.supports.resource.RemoteResourceDescriptor;
+import org.bytesoft.bytejta.supports.wire.RemoteCoordinator;
 import org.bytesoft.common.utils.ByteUtils;
 import org.bytesoft.common.utils.CommonUtils;
 import org.bytesoft.compensable.CompensableBeanFactory;
@@ -34,26 +36,31 @@ import org.bytesoft.compensable.CompensableManager;
 import org.bytesoft.compensable.TransactionContext;
 import org.bytesoft.compensable.archive.CompensableArchive;
 import org.bytesoft.compensable.aware.CompensableBeanFactoryAware;
+import org.bytesoft.compensable.aware.CompensableEndpointAware;
 import org.bytesoft.compensable.logging.CompensableLogger;
 import org.bytesoft.transaction.CommitRequiredException;
 import org.bytesoft.transaction.RollbackRequiredException;
 import org.bytesoft.transaction.Transaction;
+import org.bytesoft.transaction.TransactionLock;
 import org.bytesoft.transaction.TransactionRecovery;
 import org.bytesoft.transaction.TransactionRepository;
 import org.bytesoft.transaction.archive.TransactionArchive;
 import org.bytesoft.transaction.archive.XAResourceArchive;
 import org.bytesoft.transaction.recovery.TransactionRecoveryCallback;
 import org.bytesoft.transaction.recovery.TransactionRecoveryListener;
+import org.bytesoft.transaction.supports.resource.XAResourceDescriptor;
 import org.bytesoft.transaction.supports.serialize.XAResourceDeserializer;
 import org.bytesoft.transaction.xa.TransactionXid;
 import org.bytesoft.transaction.xa.XidFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class TransactionRecoveryImpl implements TransactionRecovery, TransactionRecoveryListener, CompensableBeanFactoryAware {
+public class TransactionRecoveryImpl
+		implements TransactionRecovery, TransactionRecoveryListener, CompensableBeanFactoryAware, CompensableEndpointAware {
 	static final Logger logger = LoggerFactory.getLogger(TransactionRecoveryImpl.class);
 
 	private CompensableBeanFactory beanFactory;
+	private String endpoint;
 
 	private final Map<TransactionXid, Transaction> recovered = new HashMap<TransactionXid, Transaction>();
 
@@ -99,7 +106,7 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 					Transaction tx = recovered.get(transactionXid);
 					if (tx != null) {
 						tx.setTransactionalExtra(transaction);
-						transaction.setTransactionalExtra(tx);
+						transaction.setTransactionalExtra(tx); // TODO different thread
 					}
 				} else {
 					recoverStatusIfNecessary(transaction);
@@ -109,6 +116,10 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 				transactionRepository.putErrorTransaction(compensableXid, transaction);
 			}
 		});
+
+		CompensableCoordinator compensableCoordinator = //
+				(CompensableCoordinator) this.beanFactory.getCompensableCoordinator();
+		compensableCoordinator.markParticipantReady();
 	}
 
 	public CompensableTransactionImpl reconstructTransaction(TransactionArchive transactionArchive) {
@@ -134,7 +145,17 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 		List<XAResourceArchive> participantList = archive.getRemoteResources();
 		for (int i = 0; i < participantList.size(); i++) {
 			XAResourceArchive participantArchive = participantList.get(i);
+			XAResourceDescriptor descriptor = participantArchive.getDescriptor();
+			String identifier = descriptor.getIdentifier();
+
 			transaction.getParticipantArchiveList().add(participantArchive);
+			if (RemoteResourceDescriptor.class.isInstance(descriptor)) {
+				RemoteResourceDescriptor resourceDescriptor = (RemoteResourceDescriptor) descriptor;
+				RemoteCoordinator remoteCoordinator = resourceDescriptor.getDelegate();
+				String application = remoteCoordinator.getApplication();
+				transaction.getApplicationArchiveMap().put(application, participantArchive);
+			} // end-if (RemoteResourceDescriptor.class.isInstance(descriptor))
+			transaction.getParticipantArchiveMap().put(identifier, participantArchive);
 		}
 
 		List<CompensableArchive> compensableList = archive.getCompensableResourceList();
@@ -233,8 +254,9 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 
 		Xid transactionXid = recordKey.xid;
 		try {
-			XAResource xares = resourceDeserializer.deserialize(recordKey.resource);
-			RecoveredResource resource = (RecoveredResource) xares;
+			LocalXAResourceDescriptor descriptor = //
+					(LocalXAResourceDescriptor) resourceDeserializer.deserialize(recordKey.resource);
+			RecoveredResource resource = (RecoveredResource) descriptor.getDelegate();
 			resource.recoverable(transactionXid);
 			return true;
 		} catch (XAException xaex) {
@@ -259,11 +281,10 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 		return null;
 	}
 
-	public void timingRecover() {
+	public synchronized void timingRecover() {
 		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
 		List<Transaction> transactions = transactionRepository.getErrorTransactionList();
-		int total = transactions == null ? 0 : transactions.size();
-		int value = 0;
+		int total = transactions == null ? 0 : transactions.size(), value = 0;
 		for (int i = 0; transactions != null && i < transactions.size(); i++) {
 			Transaction transaction = transactions.get(i);
 			org.bytesoft.transaction.TransactionContext transactionContext = transaction.getTransactionContext();
@@ -293,51 +314,107 @@ public class TransactionRecoveryImpl implements TransactionRecovery, Transaction
 		logger.debug("transaction-recovery: total= {}, success= {}", total, value);
 	}
 
-	public synchronized void recoverTransaction(Transaction transaction)
+	public void recoverTransaction(Transaction transaction)
 			throws CommitRequiredException, RollbackRequiredException, SystemException {
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
 		org.bytesoft.transaction.TransactionContext transactionContext = transaction.getTransactionContext();
 
 		if (transactionContext.isCoordinator()) {
-			try {
-				compensableManager.associateThread(transaction);
-				this.recoverCoordinator(transaction);
-			} finally {
-				compensableManager.desociateThread();
-			}
-		} // end-if (coordinator)
+			transaction.recover();
+			this.recoverCoordinator(transaction);
+		} else {
+			transaction.recover();
+			this.recoverParticipant(transaction);
+		}
 
 	}
 
-	public synchronized void recoverCoordinator(Transaction transaction)
+	private void recoverCoordinator(Transaction transaction)
 			throws CommitRequiredException, RollbackRequiredException, SystemException {
+		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+		TransactionLock compensableLock = this.beanFactory.getCompensableLock();
 
 		org.bytesoft.transaction.TransactionContext transactionContext = transaction.getTransactionContext();
-		switch (transaction.getTransactionStatus()) {
-		case Status.STATUS_ACTIVE:
-		case Status.STATUS_MARKED_ROLLBACK:
-		case Status.STATUS_PREPARING:
-		case Status.STATUS_UNKNOWN:
-			if (transactionContext.isPropagated() == false) {
-				transaction.recoveryRollback();
-				transaction.recoveryForget();
+		TransactionXid xid = transactionContext.getXid();
+
+		boolean forgetRequired = false;
+		boolean locked = false;
+		try {
+			compensableManager.associateThread(transaction);
+
+			switch (transaction.getTransactionStatus()) {
+			case Status.STATUS_ACTIVE:
+			case Status.STATUS_MARKED_ROLLBACK:
+			case Status.STATUS_PREPARING:
+			case Status.STATUS_UNKNOWN: /* TODO */ {
+				if (transactionContext.isPropagated() == false) {
+					if ((locked = compensableLock.lockTransaction(xid, this.endpoint)) == false) {
+						throw new SystemException();
+					}
+
+					transaction.recoveryRollback();
+					forgetRequired = true;
+				}
+				break;
 			}
-			break;
-		case Status.STATUS_ROLLING_BACK:
-			transaction.recoveryRollback();
-			transaction.recoveryForget();
-			break;
-		case Status.STATUS_PREPARED:
-		case Status.STATUS_COMMITTING:
-			transaction.recoveryCommit();
-			transaction.recoveryForget();
-			break;
-		case Status.STATUS_COMMITTED:
-		case Status.STATUS_ROLLEDBACK:
-		default:
-			// ignore
+			case Status.STATUS_ROLLING_BACK: {
+				if ((locked = compensableLock.lockTransaction(xid, this.endpoint)) == false) {
+					throw new SystemException();
+				}
+
+				transaction.recoveryRollback();
+				forgetRequired = true;
+				break;
+			}
+			case Status.STATUS_PREPARED:
+			case Status.STATUS_COMMITTING: {
+				if ((locked = compensableLock.lockTransaction(xid, this.endpoint)) == false) {
+					throw new SystemException();
+				}
+
+				transaction.recoveryCommit();
+				forgetRequired = true;
+				break;
+			}
+			case Status.STATUS_COMMITTED:
+			case Status.STATUS_ROLLEDBACK:
+				forgetRequired = true;
+				break;
+			default: // ignore
+			}
+		} finally {
+			compensableManager.desociateThread();
+			if (locked) {
+				compensableLock.unlockTransaction(xid, this.endpoint);
+			} // end-if (locked)
+			if (forgetRequired) {
+				transaction.forgetQuietly(); // forget transaction
+			} // end-if (forgetRequired)
 		}
 
+	}
+
+	private void recoverParticipant(Transaction transaction)
+			throws CommitRequiredException, RollbackRequiredException, SystemException {
+		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+
+		try {
+			compensableManager.associateThread(transaction);
+
+			switch (transaction.getTransactionStatus()) {
+			case Status.STATUS_COMMITTED:
+			case Status.STATUS_ROLLEDBACK:
+				transaction.forgetQuietly();
+				break;
+			default: // ignore
+			}
+		} finally {
+			compensableManager.desociateThread();
+		}
+
+	}
+
+	public void setEndpoint(String identifier) {
+		this.endpoint = identifier;
 	}
 
 	public void setBeanFactory(CompensableBeanFactory tbf) {

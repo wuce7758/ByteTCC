@@ -24,7 +24,6 @@ import org.bytesoft.compensable.CompensableBeanFactory;
 import org.bytesoft.compensable.aware.CompensableBeanFactoryAware;
 import org.bytesoft.transaction.Transaction;
 import org.bytesoft.transaction.TransactionContext;
-import org.bytesoft.transaction.internal.TransactionException;
 import org.bytesoft.transaction.xa.XidFactory;
 
 public class TransactionCoordinator implements RemoteCoordinator, CompensableBeanFactoryAware {
@@ -97,34 +96,6 @@ public class TransactionCoordinator implements RemoteCoordinator, CompensableBea
 		return resultArray;
 	}
 
-	public void recoveryCommit(Xid xid, boolean onePhaseCommit) throws XAException {
-		RemoteCoordinator compensableCoordinator = this.beanFactory.getCompensableCoordinator();
-		RemoteCoordinator transactionCoordinator = this.beanFactory.getTransactionCoordinator();
-
-		int formatId = xid.getFormatId();
-		if (XidFactory.JTA_FORMAT_ID == formatId) {
-			transactionCoordinator.recoveryCommit(xid, onePhaseCommit);
-		} else if (XidFactory.TCC_FORMAT_ID == formatId) {
-			compensableCoordinator.recoveryCommit(xid, onePhaseCommit);
-		} else {
-			throw new XAException(XAException.XAER_INVAL);
-		}
-	}
-
-	public void recoveryRollback(Xid xid) throws XAException {
-		RemoteCoordinator compensableCoordinator = this.beanFactory.getCompensableCoordinator();
-		RemoteCoordinator transactionCoordinator = this.beanFactory.getTransactionCoordinator();
-
-		int formatId = xid.getFormatId();
-		if (XidFactory.JTA_FORMAT_ID == formatId) {
-			transactionCoordinator.recoveryRollback(xid);
-		} else if (XidFactory.TCC_FORMAT_ID == formatId) {
-			compensableCoordinator.recoveryRollback(xid);
-		} else {
-			throw new XAException(XAException.XAER_INVAL);
-		}
-	}
-
 	public void forget(Xid xid) throws XAException {
 		RemoteCoordinator compensableCoordinator = this.beanFactory.getCompensableCoordinator();
 		RemoteCoordinator transactionCoordinator = this.beanFactory.getTransactionCoordinator();
@@ -139,18 +110,20 @@ public class TransactionCoordinator implements RemoteCoordinator, CompensableBea
 		}
 	}
 
-	public void recoveryForget(Xid xid) throws XAException {
+	public void forgetQuietly(Xid xid) {
 		RemoteCoordinator compensableCoordinator = this.beanFactory.getCompensableCoordinator();
 		RemoteCoordinator transactionCoordinator = this.beanFactory.getTransactionCoordinator();
 
 		int formatId = xid.getFormatId();
 		if (XidFactory.JTA_FORMAT_ID == formatId) {
-			transactionCoordinator.recoveryForget(xid);
+			transactionCoordinator.forgetQuietly(xid);
 		} else if (XidFactory.TCC_FORMAT_ID == formatId) {
-			compensableCoordinator.recoveryForget(xid);
-		} else {
-			throw new XAException(XAException.XAER_INVAL);
+			compensableCoordinator.forgetQuietly(xid);
 		}
+	}
+
+	public String getApplication() {
+		return this.beanFactory.getCompensableCoordinator().getApplication();
 	}
 
 	public String getIdentifier() {
@@ -165,12 +138,12 @@ public class TransactionCoordinator implements RemoteCoordinator, CompensableBea
 		throw new XAException(XAException.XAER_RMERR);
 	}
 
-	public Transaction start(TransactionContext transactionContext, int flags) throws TransactionException {
-		throw new TransactionException(XAException.XAER_RMERR);
+	public Transaction start(TransactionContext transactionContext, int flags) throws XAException {
+		throw new XAException(XAException.XAER_RMERR);
 	}
 
-	public Transaction end(TransactionContext transactionContext, int flags) throws TransactionException {
-		throw new TransactionException(XAException.XAER_RMERR);
+	public Transaction end(TransactionContext transactionContext, int flags) throws XAException {
+		throw new XAException(XAException.XAER_RMERR);
 	}
 
 	public boolean isSameRM(XAResource xares) throws XAException {

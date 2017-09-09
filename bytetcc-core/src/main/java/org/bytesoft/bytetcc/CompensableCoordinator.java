@@ -16,6 +16,8 @@
 package org.bytesoft.bytetcc;
 
 import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import javax.transaction.HeuristicMixedException;
 import javax.transaction.HeuristicRollbackException;
@@ -33,12 +35,10 @@ import org.bytesoft.compensable.CompensableTransaction;
 import org.bytesoft.compensable.aware.CompensableBeanFactoryAware;
 import org.bytesoft.compensable.aware.CompensableEndpointAware;
 import org.bytesoft.compensable.logging.CompensableLogger;
-import org.bytesoft.transaction.CommitRequiredException;
-import org.bytesoft.transaction.RollbackRequiredException;
 import org.bytesoft.transaction.Transaction;
 import org.bytesoft.transaction.TransactionContext;
+import org.bytesoft.transaction.TransactionLock;
 import org.bytesoft.transaction.TransactionRepository;
-import org.bytesoft.transaction.internal.TransactionException;
 import org.bytesoft.transaction.xa.TransactionXid;
 import org.bytesoft.transaction.xa.XidFactory;
 import org.slf4j.Logger;
@@ -47,21 +47,25 @@ import org.slf4j.LoggerFactory;
 public class CompensableCoordinator implements RemoteCoordinator, CompensableBeanFactoryAware, CompensableEndpointAware {
 	static final Logger logger = LoggerFactory.getLogger(CompensableCoordinator.class);
 
-	private String endpoint;
 	private CompensableBeanFactory beanFactory;
+	private String endpoint;
+
+	private transient boolean ready = false;
+	private final Lock lock = new ReentrantLock();
 
 	public Transaction getTransactionQuietly() {
 		CompensableManager transactionManager = this.beanFactory.getCompensableManager();
 		return transactionManager.getTransactionQuietly();
 	}
 
-	public Transaction start(TransactionContext transactionContext, int flags) throws TransactionException {
+	public Transaction start(TransactionContext transactionContext, int flags) throws XAException {
 		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
 		CompensableLogger compensableLogger = this.beanFactory.getCompensableLogger();
 		TransactionRepository compensableRepository = this.beanFactory.getCompensableRepository();
+		TransactionLock compensableLock = this.beanFactory.getCompensableLock();
 
 		if (compensableManager.getTransactionQuietly() != null) {
-			throw new TransactionException(XAException.XAER_PROTO);
+			throw new XAException(XAException.XAER_PROTO);
 		}
 		TransactionXid globalXid = transactionContext.getXid();
 		Transaction transaction = compensableRepository.getTransaction(globalXid);
@@ -75,21 +79,28 @@ public class CompensableCoordinator implements RemoteCoordinator, CompensableBea
 			logger.info("{}| compensable transaction begin!", ByteUtils.byteArrayToString(globalXid.getGlobalTransactionId()));
 		}
 
+		boolean locked = compensableLock.lockTransaction(globalXid, this.endpoint);
+		if (locked == false) {
+			throw new XAException(XAException.XAER_PROTO);
+		}
+
 		compensableManager.associateThread(transaction);
 
 		return transaction;
 	}
 
-	public Transaction end(TransactionContext transactionContext, int flags) throws TransactionException {
+	public Transaction end(TransactionContext transactionContext, int flags) throws XAException {
 		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+		TransactionLock compensableLock = this.beanFactory.getCompensableLock();
+
 		CompensableTransaction transaction = compensableManager.getCompensableTransactionQuietly();
 		if (transaction == null) {
-			throw new TransactionException(XAException.XAER_PROTO);
+			throw new XAException(XAException.XAER_PROTO);
 		}
 
-		// clear CompensableTransactionImpl.transientArchiveList in CompensableTransactionImpl.onCommitSuccess().
-		// ((CompensableTransactionImpl) transaction).participantComplete();
 		compensableManager.desociateThread();
+
+		compensableLock.unlockTransaction(transactionContext.getXid(), this.endpoint);
 
 		return transaction;
 	}
@@ -103,43 +114,99 @@ public class CompensableCoordinator implements RemoteCoordinator, CompensableBea
 	}
 
 	public void commit(Xid xid, boolean onePhase) throws XAException {
+		this.checkParticipantReadyIfNecessary();
+
 		if (xid == null) {
 			throw new XAException(XAException.XAER_INVAL);
 		} else if (onePhase == false) {
 			throw new XAException(XAException.XAER_RMERR);
 		}
+
+		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
+		TransactionLock compensableLock = this.beanFactory.getCompensableLock();
+
+		TransactionXid globalXid = xidFactory.createGlobalXid(xid.getGlobalTransactionId());
+
+		CompensableTransaction transaction = null;
+		boolean success = false;
+		boolean locked = false;
+		try {
+			if ((locked = compensableLock.lockTransaction(globalXid, this.endpoint)) == false) {
+				throw new XAException(XAException.XAER_RMERR);
+			}
+
+			transaction = this.invokeCommit(globalXid, onePhase);
+
+			success = true;
+		} catch (XAException xaex) {
+			switch (xaex.errorCode) {
+			case XAException.XA_HEURRB:
+			case XAException.XA_HEURMIX:
+			case XAException.XA_HEURCOM:
+				success = true;
+				break;
+			}
+			throw xaex; // throw XAException
+		} catch (RuntimeException rex) {
+			throw new XAException(XAException.XAER_RMERR); // should never happen
+		} finally {
+			if (locked) {
+				compensableLock.unlockTransaction(globalXid, this.endpoint);
+			} // end-if (locked)
+			if (success) {
+				transaction.forgetQuietly(); // forget transaction
+			} // end-if (success)
+		}
+	}
+
+	private CompensableTransaction invokeCommit(Xid xid, boolean onePhase) throws XAException {
 		TransactionRepository compensableRepository = this.beanFactory.getCompensableRepository();
 		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
+
+		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+
 		TransactionXid globalXid = xidFactory.createGlobalXid(xid.getGlobalTransactionId());
 		CompensableTransaction transaction = (CompensableTransaction) compensableRepository.getTransaction(globalXid);
 		if (transaction == null) {
 			throw new XAException(XAException.XAER_NOTA);
 		}
 
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
 		try {
 			compensableManager.associateThread(transaction);
-			transaction.commit();
+
+			transaction.participantCommit(onePhase);
+			// success = true;
 		} catch (SecurityException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} catch (IllegalStateException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} catch (RollbackException ex) {
+			// success = true;
 			throw new XAException(XAException.XA_HEURRB);
 		} catch (HeuristicMixedException ex) {
+			// success = true;
 			throw new XAException(XAException.XA_HEURMIX);
 		} catch (HeuristicRollbackException ex) {
+			// success = true;
 			throw new XAException(XAException.XA_HEURRB);
 		} catch (SystemException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} catch (RuntimeException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} finally {
 			compensableManager.desociateThread();
 		}
+
+		return transaction;
 	}
 
 	public void forget(Xid xid) throws XAException {
+		this.checkParticipantReadyIfNecessary();
+
 		if (xid == null) {
 			throw new XAException(XAException.XAER_INVAL);
 		}
@@ -160,24 +227,20 @@ public class CompensableCoordinator implements RemoteCoordinator, CompensableBea
 		}
 	}
 
-	public void recoveryForget(Xid xid) throws XAException {
-		if (xid == null) {
-			throw new XAException(XAException.XAER_INVAL);
-		}
-		TransactionRepository compensableRepository = this.beanFactory.getCompensableRepository();
-		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
-		TransactionXid globalXid = xidFactory.createGlobalXid(xid.getGlobalTransactionId());
-		CompensableTransaction transaction = (CompensableTransaction) compensableRepository.getTransaction(globalXid);
-		if (transaction == null) {
-			throw new XAException(XAException.XAER_NOTA);
-		}
-
+	public void forgetQuietly(Xid xid) {
 		try {
-			transaction.recoveryForget();
-		} catch (SystemException ex) {
-			throw new XAException(XAException.XAER_RMERR);
-		} catch (RuntimeException rex) {
-			throw new XAException(XAException.XAER_RMERR);
+			this.forget(xid);
+		} catch (XAException ex) {
+			switch (ex.errorCode) {
+			case XAException.XAER_NOTA:
+				break;
+			default:
+				logger.error("{}| Error occurred while forgeting remote coordinator.",
+						ByteUtils.byteArrayToString(xid.getGlobalTransactionId()), ex);
+			}
+		} catch (RuntimeException ex) {
+			logger.error("{}| Error occurred while forgeting remote coordinator.",
+					ByteUtils.byteArrayToString(xid.getGlobalTransactionId()), ex);
 		}
 	}
 
@@ -194,211 +257,111 @@ public class CompensableCoordinator implements RemoteCoordinator, CompensableBea
 	}
 
 	public Xid[] recover(int flag) throws XAException {
-		TransactionRepository compensableRepository = this.beanFactory.getCompensableRepository();
-		List<Transaction> transactionList = compensableRepository.getErrorTransactionList();
-		Xid[] xidArray = new Xid[transactionList == null ? 0 : transactionList.size()];
-		for (int i = 0; i < xidArray.length; i++) {
+		this.checkParticipantReadyIfNecessary();
+
+		TransactionRepository repository = beanFactory.getTransactionRepository();
+		List<Transaction> transactionList = repository.getActiveTransactionList();
+
+		TransactionXid[] xidArray = new TransactionXid[transactionList.size()];
+
+		for (int i = 0; i < transactionList.size(); i++) {
 			Transaction transaction = transactionList.get(i);
-			TransactionContext transactionContext = transaction.getTransactionContext();
-			xidArray[i] = transactionContext.getXid();
+			xidArray[i] = transaction.getTransactionContext().getXid();
 		}
+
 		return xidArray;
 	}
 
 	public void rollback(Xid xid) throws XAException {
+		this.checkParticipantReadyIfNecessary();
+
 		if (xid == null) {
 			throw new XAException(XAException.XAER_INVAL);
 		}
+		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
+		TransactionLock compensableLock = this.beanFactory.getCompensableLock();
+
+		TransactionXid globalXid = xidFactory.createGlobalXid(xid.getGlobalTransactionId());
+
+		CompensableTransaction transaction = null;
+		boolean success = false;
+		boolean locked = false;
+		try {
+			if ((locked = compensableLock.lockTransaction(globalXid, this.endpoint)) == false) {
+				throw new XAException(XAException.XAER_RMERR);
+			}
+
+			transaction = this.invokeRollback(globalXid);
+			success = true;
+		} catch (RuntimeException ex) {
+			throw new XAException(XAException.XAER_RMERR); // should never happen
+		} finally {
+			if (locked) {
+				compensableLock.unlockTransaction(globalXid, this.endpoint);
+			} // end-if (locked)
+			if (success) {
+				transaction.forgetQuietly(); // forget transaction
+			} // end-if (success)
+		}
+
+	}
+
+	private CompensableTransaction invokeRollback(Xid xid) throws XAException {
 		TransactionRepository compensableRepository = this.beanFactory.getCompensableRepository();
 		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
+
+		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
+
 		TransactionXid globalXid = xidFactory.createGlobalXid(xid.getGlobalTransactionId());
 		CompensableTransaction transaction = (CompensableTransaction) compensableRepository.getTransaction(globalXid);
 		if (transaction == null) {
 			throw new XAException(XAException.XAER_NOTA);
 		}
 
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
 		try {
 			compensableManager.associateThread(transaction);
-			transaction.rollback();
+
+			transaction.participantRollback();
+			// success = true;
 		} catch (IllegalStateException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} catch (SystemException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} catch (RuntimeException ex) {
+			compensableRepository.putErrorTransaction(globalXid, transaction);
 			throw new XAException(XAException.XAER_RMERR);
 		} finally {
 			compensableManager.desociateThread();
 		}
+
+		return transaction;
 	}
 
-	public void recoveryCommit(Xid xid, boolean onePhase) throws XAException {
-		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
-		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
-		TransactionXid branchXid = (TransactionXid) xid;
-		TransactionXid globalXid = xidFactory.createGlobalXid(branchXid.getGlobalTransactionId());
-		Transaction transaction = transactionRepository.getTransaction(globalXid);
-		if (transaction == null) {
-			throw new XAException(XAException.XAER_NOTA);
-		}
-
-		TransactionContext transactionContext = transaction.getTransactionContext();
-		if (transactionContext.isRecoveried()) {
-			this.recoveryCommitRecoveredTransaction(globalXid, onePhase);
-		} else {
-			this.recoveryCommitActiveTransaction(globalXid, onePhase);
-		}
-	}
-
-	private void recoveryCommitRecoveredTransaction(TransactionXid xid, boolean onePhase) throws XAException {
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
-		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
-		Transaction transaction = transactionRepository.getTransaction(xid);
-
+	public void markParticipantReady() {
 		try {
-			compensableManager.associateThread(transaction);
-			transaction.recoveryCommit();
-		} catch (CommitRequiredException ex) {
-			logger.error("Error occurred while committing(recovery) recovered transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (SystemException ex) {
-			logger.error("Error occurred while committing(recovery) recovered transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (RuntimeException ex) {
-			logger.error("Error occurred while committing(recovery) recovered transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
+			this.lock.lock();
+			this.ready = true;
 		} finally {
-			compensableManager.desociateThread();
+			this.lock.unlock();
 		}
 	}
 
-	private void recoveryCommitActiveTransaction(TransactionXid xid, boolean onePhase) throws XAException {
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
-		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
-		Transaction transaction = transactionRepository.getTransaction(xid);
+	private void checkParticipantReadyIfNecessary() throws XAException {
+		if (this.ready == false) {
+			this.checkParticipantReady();
+		}
+	}
 
+	private void checkParticipantReady() throws XAException {
 		try {
-			compensableManager.associateThread(transaction);
-			transaction.recoveryCommit();
-		} catch (CommitRequiredException ex) {
-			logger.error("Error occurred while committing(recovery) active transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (SystemException ex) {
-			logger.error("Error occurred while committing(recovery) active transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (RuntimeException ex) {
-			logger.error("Error occurred while committing(recovery) active transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
+			this.lock.lock();
+			if (this.ready == false) {
+				throw new XAException(XAException.XAER_RMFAIL);
+			}
 		} finally {
-			compensableManager.desociateThread();
-		}
-	}
-
-	public void recoveryRollback(Xid xid) throws XAException {
-		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
-		XidFactory xidFactory = this.beanFactory.getCompensableXidFactory();
-		TransactionXid branchXid = (TransactionXid) xid;
-		TransactionXid globalXid = xidFactory.createGlobalXid(branchXid.getGlobalTransactionId());
-
-		Transaction transaction = transactionRepository.getTransaction(globalXid);
-		if (transaction == null) {
-			throw new XAException(XAException.XAER_NOTA);
-		}
-
-		TransactionContext transactionContext = transaction.getTransactionContext();
-		if (transactionContext.isRecoveried()) {
-			this.recoveryRollbackRecoveredTransaction(globalXid);
-		} else {
-			this.recoveryRollbackActiveTransaction(globalXid);
-		}
-	}
-
-	private void recoveryRollbackRecoveredTransaction(TransactionXid xid) throws XAException {
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
-		TransactionRepository transactionRepository = this.beanFactory.getCompensableRepository();
-		Transaction transaction = transactionRepository.getTransaction(xid);
-
-		try {
-			compensableManager.associateThread(transaction);
-			transaction.recoveryRollback();
-		} catch (RollbackRequiredException rrex) {
-			logger.error("Error occurred while rolling back(recovery) recovered transaction.", rrex);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(rrex);
-			throw xaex;
-		} catch (SystemException ex) {
-			logger.error("Error occurred while rolling back(recovery) recovered transaction.", ex);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (RuntimeException rrex) {
-			logger.error("Error occurred while rolling back(recovery) recovered transaction.", rrex);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(rrex);
-			throw xaex;
-		} finally {
-			compensableManager.desociateThread();
-		}
-	}
-
-	private void recoveryRollbackActiveTransaction(TransactionXid xid) throws XAException {
-		CompensableManager compensableManager = this.beanFactory.getCompensableManager();
-		TransactionRepository transactionRepository = beanFactory.getCompensableRepository();
-		Transaction transaction = transactionRepository.getTransaction(xid);
-
-		try {
-			compensableManager.associateThread(transaction);
-			transaction.recoveryRollback();
-		} catch (RollbackRequiredException rrex) {
-			logger.error("Error occurred while rolling back(recovery) active transaction.", rrex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(rrex);
-			throw xaex;
-		} catch (SystemException ex) {
-			logger.error("Error occurred while rolling back(recovery) active transaction.", ex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(ex);
-			throw xaex;
-		} catch (RuntimeException rrex) {
-			logger.error("Error occurred while rolling back(recovery) active transaction.", rrex);
-			transactionRepository.putErrorTransaction(xid, transaction);
-
-			XAException xaex = new XAException(XAException.XAER_RMERR);
-			xaex.initCause(rrex);
-			throw xaex;
-		} finally {
-			compensableManager.desociateThread();
+			this.lock.unlock();
 		}
 	}
 
@@ -411,6 +374,10 @@ public class CompensableCoordinator implements RemoteCoordinator, CompensableBea
 	}
 
 	public String getIdentifier() {
+		return this.endpoint;
+	}
+
+	public String getApplication() {
 		return this.endpoint;
 	}
 
